@@ -1,0 +1,200 @@
+Schmetterling - Software Architecture (rev 0)
+=============================================
+
+Overview
+--------
+The system has one Main Controller (Schmetterling_MB, STM32F103C8, see
+HW/hw_arch_description.txt) and up to 8 User Modules on a shared I2C bus.
+Each User Module has 2 buttons, UP and DOWN, each press changing that
+module's speed request by +1 / -1, and reports a health status. The Main Controller polls the modules round robin, adds up the
+speed requests of all healthy modules, and drives the 3-phase motor to the
+resulting target speed.
+
+    User Module 0..7  --I2C (PCA9306)-->  Main Controller  --TIM1 PWM-->
+    (buttons, health)                     (sum, ramp, ctrl)   IRS2103 x3 -> motor
+
+SW components:
+  SW/MainController  - firmware for the Schmetterling_MB board
+  SW/UserModule      - firmware for the user module (I2C slave)
+
+
+Main Controller - HW resources used
+-----------------------------------
+TIM1 CH1..3 / CH1N..3N  complementary PWM to the 3 half-bridges
+ADC1                    phase currents (shunt amps), bus voltage, RT1 (PA1)
+I2C2 PB10/PB11          I2C master -> PCA9306 -> User Module bus
+USART1 PB6/PB7          debug / telemetry via CP2102N (USB-C)
+SysTick                 1 ms system time base (scheduler)
+IWDG                    independent watchdog
+GPIO                    status LED (PB0), ARW_0..3 / SEG_x indicators
+
+
+Main Controller - SW layers
+---------------------------
+  App       : speed_request (sum + validation), speed_ramp, supervisor,
+              hmi (LED / indicators), telemetry
+  Services  : scheduler (1 ms), i2c_poll (round robin), motor_ctrl
+              (commutation + speed loop), protection (overcurrent,
+              under/over voltage)
+  Drivers   : HAL/LL for TIM1, ADC1+DMA, I2C2 (interrupt driven), USART1,
+              GPIO, IWDG
+
+
+I2C addressing
+--------------
+- 7-bit addresses 0x20..0x27, one per module:
+      address = 0x20 + MODULE_ID      (MODULE_ID = 0..7)
+- MODULE_ID is set on the User Module with 3 address jumpers/straps
+  (or a value stored in flash at production), read once at startup.
+- 0x20..0x27 avoids the I2C reserved ranges (0x00-0x07, 0x78-0x7F).
+- Bus speed: 400 kHz (Fast mode). PCA9306 supports it; pull-ups on both
+  sides must be sized for rise time tr <= 300 ns at the real bus
+  capacitance (tr ~ 0.85 * Rpu * Cbus, e.g. 100 pF -> Rpu <= ~3.3k).
+- STM32F1 I2C clock: an exact 400 kHz needs PCLK1 to be a multiple of
+  1.2 MHz (DUTY=0, Tlow/Thigh = 2) or 10 MHz (DUTY=1, 16/9),
+  e.g. PCLK1 = 36 MHz with DUTY=0 (CCR = 30).
+
+
+I2C message (User Module -> Main Controller, 1 byte)
+----------------------------------------------------
+The Main Controller does a 1-byte read from each module address.
+
+    bit:   7       6       5       4   3   2   1   0
+         +-------+-------+-------+-------------------+
+         | HLTH  | ALIVE |  PAR  |   SPEED_REQ[4:0]  |
+         +-------+-------+-------+-------------------+
+
+  HLTH       1 = module healthy, 0 = module faulted (request ignored)
+  ALIVE      toggles on every new message (each read); a value that
+             does not toggle means the module firmware is frozen
+  PAR        odd parity over the whole byte (bits 7..0 together have an
+             odd number of 1s). Bus stuck low (0x00) or stuck high
+             (0xFF) both fail this check.
+  SPEED_REQ  requested speed level of this module, 0..31 (unsigned)
+
+- There are only 2 buttons: one press of UP adds 1, one press of DOWN
+  subtracts 1 (saturated at 0..31, no auto-repeat). The module keeps
+  this level itself and always sends the absolute value, not button
+  events, so a lost or failed frame never loses a key press.
+- Optional (later): a 1-byte write from master to module for feedback
+  (e.g. LED showing "request accepted" / "system fault").
+
+
+Full I2C frame (1-byte read) and timing at 400 kHz
+--------------------------------------------------
+On the wire, the payload byte above is wrapped in address and framing
+bits. One poll of one module is a single read transaction:
+
+  driven by:  M   M M M M M M M  M    S    S S S S S S S S   M    M
+            +---+---------------+---+-----+-----------------+------+---+
+            | S | A6 ........ A0| R | ACK | D7 ......... D0 | NACK | P |
+            +---+---------------+---+-----+-----------------+------+---+
+              |   7-bit address   |   |         payload         |    |
+              |   0x20 + ID       |   |  HLTH ALIVE PAR REQ[4:0]|    |
+            START          R/W = 1    slave ACK        master NACK  STOP
+                                                       (last byte)
+
+  M = master drives SDA, S = slave drives SDA
+  Address byte on the wire = (0x20 + ID) << 1 | 1 -> 0x41, 0x43 ... 0x4F
+
+  Field              SCL clocks   Note
+  -----------------  ----------   ----------------------------------------
+  START                 ~1        SDA falls while SCL high (tHD;STA)
+  address + R/W          8        0x41..0x4F
+  ACK (slave)            1        missing ACK -> module OFFLINE count++
+  data byte              8        payload byte, MSB first
+  NACK (master)          1        master ends the read
+  STOP                  ~1        SDA rises while SCL high (tSU;STO)
+  -----------------  ----------
+  total                ~20 bit times
+
+  Bit time at 400 kHz = 2.5 us
+  18 clocked bits x 2.5 us                        = 45.0 us
+  START + STOP (~1 bit time each, as generated)   = ~5.0 us
+  bus free time before next START (tBUF >= 1.3 us) = ~1.3 us
+  ------------------------------------------------------------
+  one poll on the wire                            ~ 51 us
+  + ISR / driver overhead on STM32F1 (estimate)   ~ 10..20 us
+  => ~ 60..70 us per poll, ~ 7 % of a 1 ms slot (vs ~0.2 ms at 100 kHz)
+
+  Slave clock stretching (module holding SCL low while loading the byte)
+  adds to this; the module should preload the next byte so it does not
+  need to stretch. The I2C driver uses a timeout of 500 us per poll; if it
+  expires the transfer is aborted, the bus recovered (9 SCL pulses +
+  STOP), and the poll counts as failed.
+
+  STM32F1 note: a 1-byte master read needs the special sequence from the
+  reference manual / errata (clear ACK before clearing ADDR, then set
+  STOP), otherwise the master ACKs and reads a second byte.
+
+
+Request validation (per module, per poll)
+-----------------------------------------
+A module's request counts only if ALL of these are true:
+  1. I2C transfer ACKed and completed (no NACK / timeout / bus error)
+  2. Parity is OK
+  3. ALIVE bit has toggled compared to the previous read
+  4. HLTH == 1
+If 3 polls in a row fail (1..3), the module is marked OFFLINE and its
+request is 0 until it delivers a valid frame again. A failure in check 4
+removes the request at once (no filtering).
+Last valid SPEED_REQ is held between polls of the same module.
+
+
+Speed calculation
+-----------------
+  sum_req      = SUM over modules (valid ? SPEED_REQ : 0)    range 0..248
+  target_speed = min(sum_req * K_RPM_PER_STEP, MAX_SPEED)
+  MAX_SPEED    may be scaled by the RT1 trimmer (ADC1_IN1, PA1)
+  set_speed    = target_speed after a slew-rate limiter (ramp up/down)
+
+- No healthy module online -> target_speed = 0 (controlled stop).
+- protection fault (overcurrent, bus voltage out of range) -> PWM off
+  immediately, independent of the requested speed.
+
+
+Scheduling (1 ms SysTick)
+-------------------------
+SysTick ISR only increments a tick counter and sets a flag; the tasks run
+in the main loop (cooperative, run-to-completion). Time critical motor
+work runs in TIM1/ADC interrupts, not in the scheduler.
+
+  Period   Task                 Work
+  -------  -------------------  --------------------------------------------
+  1 ms     i2c_poll             evaluate the result of the last read,
+                                start an interrupt-driven 1-byte read of the
+                                next module (slot = tick % 8). One read at
+                                400 kHz is ~51 us on the wire (~70 us with
+                                overhead), well inside one slot. Full round
+                                of 8 modules = 8 ms.
+  1 ms     motor_ctrl           speed loop (PI) -> PWM amplitude/frequency
+  8 ms     speed_request        after each full round: validate, sum,
+                                compute target_speed
+  10 ms    speed_ramp           slew-rate limit target -> set_speed
+  10 ms    supervisor           check faults, state machine
+                                (INIT / RUN / STOP / FAULT)
+  100 ms   hmi                  status LED, ARW / SEG indicators
+                                (e.g. number of active modules, fault code)
+  100 ms   telemetry            UART: sum_req, speed, module status
+  loop     watchdog             IWDG refresh only if all tasks above ran in
+                                their period (missed deadline -> reset)
+
+  Interrupt driven (not scheduled):
+  TIM1 update / ADC1 EOC  current sampling, overcurrent trip, commutation
+  I2C2 EV/ER              read state machine, stores byte + error status
+
+Slot spreading: tasks with the same period use different tick offsets
+(e.g. speed_ramp at tick%10==3, supervisor at tick%10==7) so one 1 ms tick
+never has to run all tasks at once.
+
+
+User Module - SW (I2C slave)
+----------------------------
+- Read MODULE_ID straps at startup -> I2C slave address 0x20 + ID.
+- Scan + debounce the 2 buttons (e.g. 5 ms scan, 20 ms debounce).
+  On each press edge: UP -> SPEED_REQ + 1, DOWN -> SPEED_REQ - 1
+  (saturated at 0..31). Both pressed at once -> ignored.
+- Health: HLTH = 0 on failed self-test, stuck button (held > N s),
+  supply out of range, or internal watchdog reset detected.
+- On each master read: send the byte from above, then toggle ALIVE and
+  recompute PAR for the next read.

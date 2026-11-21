@@ -1,0 +1,62 @@
+dd Schmetterling_MB - Functional Description (rev 0)
+=================================================
+
+Overview
+--------
+3-phase half-bridge driver for a 24 V load (e.g. BLDC/3-phase motor).
+An STM32F103C8 generates complementary PWM, three IRS2103 gate drivers
+switch three N-MOSFET half-bridges, and low-side shunts with op-amps
+provide per-phase current sensing. USB-C gives a debug/programming UART.
+
+Power supply
+------------
++24V (X3)  -> R2 (10R) / C97 -> TPS5430 buck (U96, L1, D93 SS34)
+           -> Vdrive ~9.4 V   (FB: R96 10k / R95 1k5, Vref 1.221 V)
+Vdrive     -> gate driver VCC, LM324 supply, and
+           -> R1 (10R) -> AMS1117-3.3 (VR1) -> +3V3 (MCU, logic)
+USB VBUS   -> D1 (ES2J) -> Vdrive, so the logic can be powered from USB
+              for programming/debug without 24 V present.
+Grounds:   GND (power/logic), Earth (USB shield, mounting holes),
+           tied by R41 (0R) || C20 (1n).
+Test points: M1 Vdrive, M2 3V3, M5 GND, M3 phase-1 current amp output.
+
+Power stage (x3 identical channels)
+-----------------------------------
+- MOSFETs MS50N06 (60 V). High-side drains on +24V, low-side sources to
+  GND through a 0R1 shunt. Phase node = high-side S / low-side D = VS.
+- IRS2103 half-bridge driver: HIN (active high) -> HO, /LIN (active low)
+  -> LO, with built-in dead time. HO/LO through 10R gate resistors.
+- Bootstrap supply from Vdrive via ES2J diode + 100n cap to VS.
+- 10k pull-downs on the driver inputs hold the bridge in a defined
+  state while the MCU is in reset.
+
+Current / voltage sensing
+-------------------------
+- Each shunt -> RC filter (1k + 100n) -> LM324 non-inverting amp,
+  gain = 1 + 10k/470R ~ 22  ->  ~2.2 V/A with a 0R1 shunt.
+- Bus voltage: divider R3 10k / R8 1k5 (24 V -> ~3.1 V), buffered by
+  an LM324 follower (A3 unit D).
+- RT1 (10k trimmer) -> R20/C16 -> ADC1_IN1 (PA1): setpoint input.
+
+MCU (STM32F103C8, U3)
+---------------------
+- TIM1 complementary PWM:
+    CH1  PA8  / CH1N PB13   (OUT_CH_1 / OUT_CH_1_N)
+    CH2  PA9  / CH2N PB14   (OUT_CH_2 / OUT_CH_2_N)
+    CH3  PA10 / CH3N PB15   (OUT_CH_3 / OUT_CH_3_N)
+- ADC: PA1 (ADC1_IN1).
+- UART: USART1 remapped to PB6 (Tx) / PB7 (Rx) -> CP2102N and X5.
+- I2C2: PB10 SCL / PB11 SDA -> PCA9306 level shifter (U5).
+- GPIO: ARW_0..3 (PA7, PA5, PA6, PA2), SEG_A/C/E/F (PD0, PA0, PA3, PA4),
+  status LED D5 on PB0.
+- Reset: S1 push button + R38/C21 on NRST. BOOT0 pulled low (R15).
+
+Interfaces
+----------
+P1  USB-C (USB 2.0): CP2102N (U1) USB-UART bridge, CC pull-downs R4/R5,
+    TVS protection on D+/D-/VBUS (H5VLD3B), shield to Earth.
+X3  3-pin screw terminal: phase outputs A/B/C.
+X4  5-pin SWD: 3V3 ref (via R39), GND, SWDIO, SWCLK, NRST.
+X5  7-pin ESP/debug header: BOOT, DBG_IO_0/1, UART Tx/Rx, GND, RST_ESP.
+
+
