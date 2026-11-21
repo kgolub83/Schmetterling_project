@@ -2,7 +2,7 @@
 Looping Louie on steroids, the game upgrade project
 
 ## Overview
-A 3-phase motor drives the game. Up to 8 players each have a **User Module**
+A DC motor drives the game. Up to 8 players each have a **User Module**
 with two buttons, UP and DOWN, that raise or lower that player's speed
 request. The **Main Controller** (Schmetterling_MB, STM32F103C8) polls
 all modules round robin over I2C. It adds up the requests of all healthy
