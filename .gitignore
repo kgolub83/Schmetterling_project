@@ -53,3 +53,37 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# KiCad
+# Backups and autosave files
+*-backups/
+*.bak
+*.bck
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*-bak
+*~
+_autosave-*
+\#auto_saved_files\#
+*.tmp
+*.lck
+~*.lck
+
+# Local project settings and caches
+*.kicad_prl
+*.sch-bak
+fp-info-cache
+*.cache
+
+# Netlist / exports / reports
+*.net
+*.dsn
+*.ses
+*.erc
+*.rpt
+*.drc
+
+# Fabrication outputs (regenerate from the board file)
+**/gerbers/
+**/production/
+*.zip
